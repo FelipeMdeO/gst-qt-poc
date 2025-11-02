@@ -1,0 +1,11 @@
+# Build and object files
+/build/
+bin/
+*.exe
+*.out
+*.o
+
+# IDE config files
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,10 @@
+{
+  "version": 4,
+  "configurePresets": [
+    { "name": "linux-rel", "generator": "Ninja", "binaryDir": "build/linux-rel",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } }
+  ],
+  "buildPresets": [
+    { "name": "linux-rel", "configurePreset": "linux-rel" }
+  ]
+}
