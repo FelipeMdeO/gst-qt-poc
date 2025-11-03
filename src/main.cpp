@@ -6,11 +6,25 @@
 #include <QHBoxLayout>
 #include <QSlider>
 #include <QTimer>
+#include <QElapsedTimer>
 #include <QDebug>
+
+#include <algorithm>
+#include <vector>
+#include <cstdlib>
+#include <cmath>
+#include <chrono>
 
 #include <gst/gst.h>
 #include <gst/video/videooverlay.h>
 
+// Simple percentile computation helpers
+static int percentile(std::vector<int>& v, double p) {
+  if (v.empty()) return 0;
+  size_t idx = static_cast<size_t>(std::floor((p/100.0) * (v.size()-1)));
+  std::nth_element(v.begin(), v.begin() + idx, v.end());
+  return v[idx];
+}
 
 class GstQtPlayer final : public QWidget {
   Q_OBJECT
@@ -18,7 +32,7 @@ public:
   explicit GstQtPlayer(const QString& filePath, QWidget* parent=nullptr)
     : QWidget(parent), filePath_(filePath) {
 
-    setWindowTitle("GStreamer + Qt PoC");
+    setWindowTitle("GStreamer + Qt PoC (EN + Metrics)");
     setMinimumSize(800, 480);
 
     // ---------- UI ----------
@@ -26,7 +40,7 @@ public:
 
     videoArea_ = new QWidget(this);
     videoArea_->setMinimumSize(640, 360);
-    // **Ensure native window** so we get a valid XID/surface
+    // Ensure native window so we get a valid XID/surface
     videoArea_->setAttribute(Qt::WA_NativeWindow);
     videoArea_->setUpdatesEnabled(false);
     vbox->addWidget(videoArea_);
@@ -36,6 +50,9 @@ public:
     h->addWidget(playBtn_);
     slider_ = new QSlider(Qt::Horizontal, this);
     h->addWidget(slider_);
+
+    throttleBtn_ = new QPushButton("Simulate bitrate drop", this);
+    h->addWidget(throttleBtn_);
     vbox->addLayout(h);
 
     // ---------- GStreamer init ----------
@@ -43,6 +60,7 @@ public:
     if (!gstInitted) {
       gst_init(nullptr, nullptr);
       gstInitted = true;
+      qInfo() << "[INIT] GStreamer initialized";
     }
 
     // ---------- Pipeline construction ----------
@@ -52,33 +70,38 @@ public:
 
     qVideo_    = gst_element_factory_make("queue", "qv");
     vconvert_  = gst_element_factory_make("videoconvert", "vconv");
-    vscale_   = gst_element_factory_make("videoscale", "vscale");
+    vscale_    = gst_element_factory_make("videoscale", "vscale");
+    vcaps_     = gst_element_factory_make("capsfilter", "vcaps");
 
-    // Select sink based on Qt's real platform (avoids xcb vs wayland conflict)
+    // Select sink based on Qt's real platform (avoids xcb vs wayland mismatch)
     const QString plat = QGuiApplication::platformName().toLower();
     GstElement* chosenSink = nullptr;
 
     // Allow override via environment variable (useful for troubleshooting)
     if (const char* envSink = std::getenv("GST_VIDEOSINK")) {
       chosenSink = gst_element_factory_make(envSink, "vsink");
+      qInfo() << "[INIT] GST_VIDEOSINK override =" << envSink;
     }
 
     if (!chosenSink) {
       if (plat.contains("wayland")) {
         chosenSink = gst_element_factory_make("waylandsink", "vsink");
+        qInfo() << "[INIT] Using waylandsink";
       } else if (plat.contains("xcb")) {
         chosenSink = gst_element_factory_make("ximagesink", "vsink");
-    #ifdef Q_OS_WIN
+        qInfo() << "[INIT] Using ximagesink";
+#ifdef Q_OS_WIN
       } else if (plat.contains("windows")) {
         chosenSink = gst_element_factory_make("d3d11videosink", "vsink");
-    #endif
+        qInfo() << "[INIT] Using d3d11videosink";
+#endif
       } else {
         chosenSink = gst_element_factory_make("autovideosink", "vsink");
+        qInfo() << "[INIT] Using autovideosink (fallback)";
       }
     }
 
     vsink_ = chosenSink ? chosenSink : gst_element_factory_make("autovideosink", "vsink");
-
 
     qAudio_    = gst_element_factory_make("queue", "qa");
     aconv_     = gst_element_factory_make("audioconvert", "aconv");
@@ -91,16 +114,18 @@ public:
         !qVideo_ ||
         !vconvert_ ||
         !vscale_ ||
+        !vcaps_ ||
         !vsink_ ||
         !qAudio_ ||
         !aconv_ ||
         !ares_ ||
         !asink_) {
-      qFatal("Falha criando elementos GStreamer.");
+      qFatal("[FATAL] Failed to create one or more GStreamer elements.");
     }
 
     // filesrc -> local path (native path; NOT a URI)
     g_object_set(filesrc_, "location", filePath_.toUtf8().constData(), NULL);
+    qInfo() << "[PIPELINE] Source file:" << filePath_;
 
     gst_bin_add_many(
       GST_BIN(pipeline_),
@@ -109,6 +134,7 @@ public:
       qVideo_,
       vconvert_,
       vscale_,
+      vcaps_,
       vsink_,
       qAudio_,
       aconv_,
@@ -117,19 +143,20 @@ public:
       NULL);
 
     if (!gst_element_link(filesrc_, decodebin_)) {
-      qFatal("Cannot link filesrc → decodebin");
+      qFatal("[FATAL] Cannot link filesrc → decodebin");
     }
-    if (!gst_element_link_many(qVideo_, vconvert_, vscale_, vsink_, NULL)) {
-      qFatal("Cannot link video branch");
+    if (!gst_element_link_many(qVideo_, vconvert_, vscale_, vcaps_, vsink_, NULL)) {
+      qFatal("[FATAL] Cannot link video branch");
     }
     if (!gst_element_link_many(qAudio_, aconv_, ares_, asink_, NULL)) {
-      qFatal("Cannot link audio branch");
+      qFatal("[FATAL] Cannot link audio branch");
     }
+    qInfo() << "[PIPELINE] Base links established";
 
     // decodebin creates dynamic pads -> hook defensive callback
     g_signal_connect(decodebin_, "pad-added", G_CALLBACK(&GstQtPlayer::onPadAdded), this);
 
-    // ---------- Bus: asynchronous and synchronous messages ----------
+    // ---------- Bus: async and sync messages ----------
     bus_ = gst_element_get_bus(pipeline_);
     // Regular messages (ERROR/EOS) via light polling
     busTimer_.setInterval(10);
@@ -146,6 +173,7 @@ public:
 
     // ---------- Controls ----------
     connect(playBtn_, &QPushButton::clicked, this, &GstQtPlayer::togglePlayPause);
+    connect(throttleBtn_, &QPushButton::clicked, this, &GstQtPlayer::toggleQuality);
 
     sliderTimer_.setInterval(200);
     connect(&sliderTimer_, &QTimer::timeout, this, &GstQtPlayer::updatePosition);
@@ -164,9 +192,6 @@ public:
       gst_object_unref(pipeline_);
     }
   }
-
-signals:
-  void overlayReady();
 
 protected:
   void showEvent(QShowEvent* e) override {
@@ -190,14 +215,25 @@ protected:
 
 private slots:
   void togglePlayPause() {
+    if (!pipeline_) return;
     GstState cur, pend;
     gst_element_get_state(pipeline_, &cur, &pend, 0);
     if (cur == GST_STATE_PLAYING) {
       gst_element_set_state(pipeline_, GST_STATE_PAUSED);
       playBtn_->setText("Play");
+      qInfo() << "[STATE] PLAYING -> PAUSED";
     } else {
+      // Start TTFF stopwatch on each transition to PLAYING
+      playStartTimer_.restart();
+      firstFrameSeen_ = false;
+      frames_.clear();
+      frameCount_ = 0;
+      lastPts_ = GST_CLOCK_TIME_NONE;
       gst_element_set_state(pipeline_, GST_STATE_PLAYING);
       playBtn_->setText("Pause");
+      qInfo() << "[STATE] -> PLAYING (TTFF timer armed)";
+      // Install sink pad probe (if not already) to capture first frame and intervals
+      attachSinkProbeIfNeeded();
     }
   }
 
@@ -212,8 +248,9 @@ private slots:
           GError* err = nullptr;
           gchar* dbg = nullptr;
           gst_message_parse_error(msg, &err, &dbg);
-          qCritical() << "GST ERROR:" << (err ? err->message : "unknown");
+          qCritical() << "[GST][ERROR]" << (err ? err->message : "unknown");
           if (dbg) {
+            qCritical() << "[GST][ERROR][DBG]" << dbg;
             g_free(dbg);
           }
           if (err) {
@@ -224,7 +261,7 @@ private slots:
           break;
         }
         case GST_MESSAGE_EOS:
-          qInfo() << "EOS";
+          qInfo() << "[GST] EOS";
           gst_element_set_state(pipeline_, GST_STATE_READY);
           playBtn_->setText("Play");
           break;
@@ -256,11 +293,55 @@ private slots:
       return;
     }
     const gint64 target = (gint64)slider_->value() * GST_MSECOND;
+    qInfo() << "[SEEK] to (ms):" << slider_->value();
     gst_element_seek_simple(
       pipeline_,
       GST_FORMAT_TIME,
       (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
       target);
+    // After seeks, we reset metrics to measure new segment if desired
+    lastPts_ = GST_CLOCK_TIME_NONE;
+    frames_.clear();
+    frameCount_ = 0;
+    firstFrameSeen_ = false;
+    playStartTimer_.restart();
+  }
+
+  void toggleQuality() {
+    if (!pipeline_ || !vcaps_) return;
+
+    qInfo() << "[ABR] Toggling quality. Current lowQuality =" << (lowQuality_ ? "true" : "false");
+    // Pause briefly for safe renegotiation
+    gst_element_set_state(pipeline_, GST_STATE_PAUSED);
+
+    if (!lowQuality_) {
+      // Force smaller resolution (reduced quality)
+      GstCaps* caps = gst_caps_new_simple(
+        "video/x-raw",
+        "width",  G_TYPE_INT, 640,
+        "height", G_TYPE_INT, 360,
+        NULL);
+      g_object_set(vcaps_, "caps", caps, NULL);
+      gst_caps_unref(caps);
+
+      // Signal downstream reconfigure
+      gst_element_send_event(vscale_, gst_event_new_reconfigure());
+
+      lowQuality_ = true;
+      throttleBtn_->setText("Restore quality");
+      qInfo() << "[ABR] Low quality enforced: 640x360";
+    } else {
+      // Remove restriction → allow renegotiation to full-res
+      g_object_set(vcaps_, "caps", NULL, NULL);
+      gst_element_send_event(vscale_, gst_event_new_reconfigure());
+
+      lowQuality_ = false;
+      throttleBtn_->setText("Simulate bitrate drop");
+      qInfo() << "[ABR] Quality restored (caps removed)";
+    }
+
+    // Resume playback
+    gst_element_set_state(pipeline_, GST_STATE_PLAYING);
   }
 
 private:
@@ -275,6 +356,7 @@ private:
     self->videoArea_->setAttribute(Qt::WA_NativeWindow);
     WId wid = self->videoArea_->winId();
     if (!wid || wid < 0x10) {
+      qWarning() << "[OVERLAY] Invalid window id during prepare-window-handle";
       return; // avoid BadWindow
     }
 
@@ -289,6 +371,7 @@ private:
         self->videoArea_->width(),
         self->videoArea_->height());
       gst_video_overlay_expose(GST_VIDEO_OVERLAY(self->vsink_));
+      qInfo() << "[OVERLAY] Window handle set";
     }
   }
 
@@ -306,6 +389,7 @@ private:
       if (caps) {
         gst_caps_unref(caps);
       }
+      qWarning() << "[DECODEBIN] pad-added with empty caps";
       return;
     }
 
@@ -329,20 +413,83 @@ private:
       if (sinkpad && !gst_pad_is_linked(sinkpad)) {
         const GstPadLinkReturn r = gst_pad_link(newPad, sinkpad);
         if (r != GST_PAD_LINK_OK) {
-          g_warning("Falha ao linkar decodebin pad (%s) → queue: %d", name, r);
+          qWarning() << "[LINK] Failed to link decodebin pad (" << name << ") → queue. Code:" << r;
+        } else {
+          qInfo() << "[LINK] Linked decodebin pad →" << (isVideo ? "video" : "audio") << "queue";
         }
       }
       if (sinkpad) {
         gst_object_unref(sinkpad);
       }
+    } else {
+      qWarning() << "[DECODEBIN] Ignoring pad with caps:" << name;
     }
     gst_caps_unref(caps);
+  }
+
+  static GstPadProbeReturn onSinkBufferProbe(GstPad* /*pad*/, GstPadProbeInfo* info, gpointer userData) {
+    auto* self = static_cast<GstQtPlayer*>(userData);
+    if (!self) return GST_PAD_PROBE_OK;
+
+    GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buf) return GST_PAD_PROBE_OK;
+
+    GstClockTime pts = GST_BUFFER_PTS(buf);
+    if (!self->firstFrameSeen_) {
+      self->firstFrameSeen_ = true;
+      // Time To First Frame = wallclock since we entered PLAYING
+      const qint64 ttff_ms = self->playStartTimer_.elapsed();
+      qInfo() << "[METRICS] TTFF(ms):" << ttff_ms;
+    }
+
+    if (pts != GST_CLOCK_TIME_NONE) {
+      if (self->lastPts_ != GST_CLOCK_TIME_NONE) {
+        // Compute frame interval in milliseconds based on PTS delta
+        gint64 delta_ns = (gint64)pts - (gint64)self->lastPts_;
+        if (delta_ns > 0) {
+          int delta_ms = static_cast<int>(delta_ns / GST_MSECOND);
+          self->frames_.push_back(delta_ms);
+          self->frameCount_++;
+
+          if (self->frameCount_ % 60 == 0) {
+            // Compute q50 and q95 on a copy (percentile does nth_element and mutates).
+            std::vector<int> copy = self->frames_;
+            int q50 = percentile(copy, 50.0);
+            // Re-copy to restore distribution before next percentile
+            copy = self->frames_;
+            int q95 = percentile(copy, 95.0);
+            qInfo() << "[METRICS] frame-interval-ms q50=" << q50 << " q95=" << q95 << " (n=" << self->frameCount_ << ")";
+          }
+
+          // Keep vector from growing unbounded; retain last ~1000 samples
+          if (self->frames_.size() > 1200) {
+            self->frames_.erase(self->frames_.begin(), self->frames_.begin() + 200);
+          }
+        }
+      }
+      self->lastPts_ = pts;
+    }
+    return GST_PAD_PROBE_OK;
+  }
+
+  void attachSinkProbeIfNeeded() {
+    if (sinkProbeAttached_) return;
+    GstPad* sinkpad = gst_element_get_static_pad(vsink_, "sink");
+    if (!sinkpad) {
+      qWarning() << "[PROBE] vsink sink pad not available yet";
+      return;
+    }
+    gst_pad_add_probe(sinkpad, GST_PAD_PROBE_TYPE_BUFFER, &GstQtPlayer::onSinkBufferProbe, this, nullptr);
+    sinkProbeAttached_ = true;
+    gst_object_unref(sinkpad);
+    qInfo() << "[PROBE] Buffer probe attached to video sink";
   }
 
 private:
   // UI
   QWidget*     videoArea_{nullptr};
   QPushButton* playBtn_{nullptr};
+  QPushButton* throttleBtn_{nullptr};
   QSlider*     slider_{nullptr};
 
   // GStreamer
@@ -355,6 +502,7 @@ private:
   GstElement* qVideo_{nullptr};
   GstElement* vconvert_{nullptr};
   GstElement* vscale_{nullptr};
+  GstElement* vcaps_{nullptr};
   GstElement* vsink_{nullptr};
 
   // Audio
@@ -366,6 +514,17 @@ private:
   GstBus*     bus_{nullptr};
   QTimer      busTimer_;
   QTimer      sliderTimer_;
+
+  // ABR simulation
+  bool        lowQuality_{false};
+
+  // Metrics
+  QElapsedTimer playStartTimer_;
+  bool          firstFrameSeen_{false};
+  bool          sinkProbeAttached_{false};
+  GstClockTime  lastPts_{GST_CLOCK_TIME_NONE};
+  std::vector<int> frames_;
+  int           frameCount_{0};
 };
 
 #include "main.moc"
@@ -374,16 +533,17 @@ int main(int argc, char** argv) {
   QApplication app(argc, argv);
 
   if (argc < 2) {
-    qCritical() << "Uso: gst_qt_poc <caminho-absoluto-arquivo>";
+    qCritical() << "Usage: gst_qt_poc <absolute-file-path>";
     return 1;
   }
 
   const QString path = QString::fromLocal8Bit(argv[1]);
   if (path.isEmpty()) {
-    qCritical() << "Caminho inválido.";
+    qCritical() << "Invalid path.";
     return 1;
   }
 
+  qInfo() << "[MAIN] Starting with media:" << path;
   GstQtPlayer w(path);
   w.show();
   return app.exec();
