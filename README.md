@@ -70,10 +70,3 @@ cmake --build --preset win-rel -j
 - Ready for ABR and overlay extensions  
 
 ---
-
-### 🧠 Author
-**Felipe Moura**  
-Embedded Systems Engineer | Firmware Engineer
-[github.com/FelipeMdeO](https://github.com/FelipeMdeO)
-
----
