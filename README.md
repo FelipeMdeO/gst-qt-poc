@@ -13,7 +13,8 @@ The project validates the integration of Qt and GStreamer for real-time renderin
                      → [queue → audioconvert → audioresample → autoaudiosink]
   ```
 - Render decoded video directly inside a Qt widget via `GstVideoOverlay`.  
-- Handle backend mismatches (Wayland vs X11) and hardware acceleration issues (VAAPI / DMABUF).
+- Handle backend mismatches (Wayland vs X11) and hardware acceleration issues (VAAPI / DMABUF).  
+- Provide an automated build workflow via a portable shell script (`build.sh`).
 
 ---
 
@@ -35,30 +36,46 @@ sudo apt install -y qt6-base-dev qt6-base-dev-tools     libgstreamer1.0-dev libg
 
 ---
 
-### ⚙️ Build & Run
+### ⚙️ Automated Build & Run (Using build.sh)
+
+The project includes an **automation script** `build.sh` to simplify all build steps.
+
+#### 1️⃣ Make it executable:
 ```bash
-git clone https://github.com/FelipeMdeO/gst-qt-poc.git
-cd gst-qt-poc
-
-cmake --preset linux-rel
-cmake --build --preset linux-rel -j
-
-# Run
-./build/linux-rel/gst_qt_poc /absolute/path/to/video.mp4
-```
-This project come with an example available in the folder tmps
-
-Optional environment variables for stability:
-```bash
-export GST_GL_NO_DMABUF=1
-export GST_PLUGIN_FEATURE_RANK='vaapidecodebin:0,vaapih264dec:0'
+chmod +x build.sh
 ```
 
-Cross-compile example for Windows:
+#### 2️⃣ Clean and build (Linux release preset):
 ```bash
-cmake --preset win-rel
-cmake --build --preset win-rel -j
+./build.sh --clean --preset linux-rel
 ```
+
+#### 3️⃣ Build only:
+```bash
+./build.sh --preset linux-rel
+```
+
+#### 4️⃣ Build and run directly:
+```bash
+./build.sh --preset linux-rel --run /absolute/path/to/video.mp4
+```
+
+#### 5️⃣ Cross-compile example (Windows preset):
+```bash
+./build.sh --clean --preset win-rel -j 12
+```
+
+#### 🧩 Script details
+- Automatically detects build presets (`linux-rel`, `win-rel`)
+- Cleans previous build outputs when requested (`--clean`)
+- Runs `cmake --preset` and `cmake --build` automatically
+- Uses all CPU cores unless overridden with `--jobs N`
+- Optionally launches the binary with a provided video/URI (`--run <path>`)
+- Applies recommended runtime environment variables for stability:
+  ```bash
+  export GST_GL_NO_DMABUF=1
+  export GST_PLUGIN_FEATURE_RANK='vaapidecodebin:0,vaapih264dec:0'
+  ```
 
 ---
 
@@ -68,5 +85,4 @@ cmake --build --preset win-rel -j
 - Dynamic sink selection (`ximagesink` / `waylandsink`)  
 - Robust against driver and backend mismatches  
 - Ready for ABR and overlay extensions  
-
----
+- Includes a fully automated build workflow
