@@ -1,3 +1,4 @@
+// File: src/main.cpp
 #include <QApplication>
 #include <QGuiApplication>
 #include <QWidget>
@@ -9,12 +10,14 @@
 #include <QElapsedTimer>
 #include <QDebug>
 
+// Qt file/process includes
 #include <QFileInfo>
 #include <QFile>
 #include <QDir>
 #include <QProcess>
 #include <QCoreApplication>
 #include <QIODevice>
+#include <QRegularExpression>
 
 #include <algorithm>
 #include <vector>
@@ -80,6 +83,9 @@ public:
     vscale_    = gst_element_factory_make("videoscale", "vscale");
     vcaps_     = gst_element_factory_make("capsfilter", "vcaps");
 
+    // cencdec element: optional, may be NULL if plugin not installed
+    cencdec_   = gst_element_factory_make("cencdec", "cencdec");
+
     // Select sink based on Qt's real platform (avoids xcb vs wayland mismatch)
     const QString plat = QGuiApplication::platformName().toLower();
     GstElement* chosenSink = nullptr;
@@ -130,10 +136,17 @@ public:
       qFatal("[FATAL] Failed to create one or more GStreamer elements.");
     }
 
+    if (!cencdec_) {
+      qWarning() << "[INIT] cencdec element not found - encrypted playback inside pipeline will be unavailable";
+    } else {
+      qInfo() << "[INIT] cencdec element created";
+    }
+
     // filesrc -> local path (native path; NOT a URI)
     g_object_set(filesrc_, "location", filePath_.toUtf8().constData(), NULL);
     qInfo() << "[PIPELINE] Source file:" << filePath_;
 
+    // Add elements to bin; gst_bin_add_many tolerates NULL pointers in practice
     gst_bin_add_many(
       GST_BIN(pipeline_),
       filesrc_,
@@ -147,6 +160,7 @@ public:
       aconv_,
       ares_,
       asink_,
+      cencdec_,   // optional
       NULL);
 
     if (!gst_element_link(filesrc_, decodebin_)) {
@@ -382,8 +396,11 @@ private:
     }
   }
 
+  // Robust, instrumented onPadAdded implementing cencdec routing + fallback
   static void onPadAdded(GstElement* dbin, GstPad* newPad, gpointer userData) {
     auto* self = static_cast<GstQtPlayer*>(userData);
+    if (!self) return;
+
     if (gst_pad_get_direction(newPad) != GST_PAD_SRC) {
       return;
     }
@@ -393,9 +410,7 @@ private:
       caps = gst_pad_query_caps(newPad, nullptr);
     }
     if (!caps || gst_caps_is_empty(caps)) {
-      if (caps) {
-        gst_caps_unref(caps);
-      }
+      if (caps) gst_caps_unref(caps);
       qWarning() << "[DECODEBIN] pad-added with empty caps";
       return;
     }
@@ -403,34 +418,111 @@ private:
     const GstStructure* st = gst_caps_get_structure(caps, 0);
     if (!st) {
       gst_caps_unref(caps);
+      qWarning() << "[DECODEBIN] pad-added but no structure";
       return;
     }
     const gchar* name = gst_structure_get_name(st);
     if (!name) {
       gst_caps_unref(caps);
+      qWarning() << "[DECODEBIN] pad-added but structure has no name";
       return;
     }
+
+    // log caps (free string afterwards)
+    gchar* caps_str = gst_caps_to_string(caps);
+    qInfo() << "[DECODEBIN] pad-added caps:" << (caps_str ? caps_str : "(null)") << " name=" << name;
+    if (caps_str) g_free(caps_str);
 
     const bool isVideo = g_str_has_prefix(name, "video/");
     const bool isAudio = g_str_has_prefix(name, "audio/");
 
+    // Detect encrypted variants commonly used with CENC
+    const bool isCenc = g_str_has_prefix(name, "application/x-cenc") ||
+                        g_str_has_prefix(name, "video/encv") ||
+                        g_str_has_prefix(name, "audio/enca");
+
     GstElement* targetQueue = isVideo ? self->qVideo_ : (isAudio ? self->qAudio_ : nullptr);
-    if (targetQueue) {
-      GstPad* sinkpad = gst_element_get_static_pad(targetQueue, "sink");
-      if (sinkpad && !gst_pad_is_linked(sinkpad)) {
-        const GstPadLinkReturn r = gst_pad_link(newPad, sinkpad);
-        if (r != GST_PAD_LINK_OK) {
-          qWarning() << "[LINK] Failed to link decodebin pad (" << name << ") → queue. Code:" << r;
+    if (!targetQueue) {
+      qWarning() << "[DECODEBIN] Ignoring pad with caps:" << name;
+      gst_caps_unref(caps);
+      return;
+    }
+
+    // If it's encrypted and we have a cencdec element, attempt route: demux-pad -> cencdec -> queue
+    if (isCenc && self->cencdec_) {
+      qInfo() << "[CENC] Encrypted pad detected; attempting routing via cencdec";
+
+      // Some plugins allocate resources only after state change; request READY to be safe
+      GstStateChangeReturn st_ret = gst_element_set_state(self->cencdec_, GST_STATE_READY);
+      qInfo() << "[CENC] cencdec state change requested (to READY), return code =" << st_ret;
+
+      // link demux pad -> cencdec sink
+      GstPad* cenc_sink = gst_element_get_static_pad(self->cencdec_, "sink");
+      if (!cenc_sink) {
+        qWarning() << "[CENC] cencdec sink pad not available";
+        // fallback: try direct linking demux -> queue
+      } else {
+        if (!gst_pad_is_linked(cenc_sink)) {
+          GstPadLinkReturn r = gst_pad_link(newPad, cenc_sink);
+          qInfo() << "[CENC] Attempted link: demux-pad -> cencdec sink, result code =" << r;
+          if (r != GST_PAD_LINK_OK) {
+            qWarning() << "[CENC] demux-pad -> cencdec sink link FAILED (code =" << r << ")";
+          }
         } else {
-          qInfo() << "[LINK] Linked decodebin pad →" << (isVideo ? "video" : "audio") << "queue";
+          qInfo() << "[CENC] cencdec sink pad already linked";
+        }
+        gst_object_unref(cenc_sink);
+      }
+
+      // Now link cencdec src -> queue sink (if not already linked)
+      GstPad* cenc_src = gst_element_get_static_pad(self->cencdec_, "src");
+      GstPad* q_sink   = gst_element_get_static_pad(targetQueue, "sink");
+      if (cenc_src && q_sink) {
+        if (!gst_pad_is_linked(q_sink)) {
+          GstPadLinkReturn r2 = gst_pad_link(cenc_src, q_sink);
+          qInfo() << "[CENC] Attempted link: cencdec src -> queue sink, result code =" << r2;
+          if (r2 != GST_PAD_LINK_OK) {
+            qWarning() << "[CENC] cencdec src -> queue sink link FAILED (code =" << r2 << ")";
+          } else {
+            qInfo() << "[CENC] Successfully linked cencdec ->" << (isVideo ? "video" : "audio") << "queue";
+            if (cenc_src) gst_object_unref(cenc_src);
+            if (q_sink) gst_object_unref(q_sink);
+            gst_caps_unref(caps);
+            return;
+          }
+        } else {
+          qInfo() << "[CENC] target queue sink already linked";
+          if (cenc_src) gst_object_unref(cenc_src);
+          if (q_sink) gst_object_unref(q_sink);
+          gst_caps_unref(caps);
+          return;
         }
       }
-      if (sinkpad) {
-        gst_object_unref(sinkpad);
-      }
-    } else {
-      qWarning() << "[DECODEBIN] Ignoring pad with caps:" << name;
+      if (cenc_src) gst_object_unref(cenc_src);
+      if (q_sink) gst_object_unref(q_sink);
+
+      qWarning() << "[CENC] Routing via cencdec did not succeed; attempting fallback direct link demux -> queue";
+      // fall through to fallback direct linking
     }
+
+    // Fallback / non-encrypted path: link demux pad -> queue sink
+    GstPad* sinkpad = gst_element_get_static_pad(targetQueue, "sink");
+    if (sinkpad) {
+      if (!gst_pad_is_linked(sinkpad)) {
+        GstPadLinkReturn r = gst_pad_link(newPad, sinkpad);
+        if (r != GST_PAD_LINK_OK) {
+          qWarning() << "[LINK] Failed to link decodebin pad (" << name << ") -> queue. Code:" << r;
+        } else {
+          qInfo() << "[LINK] Linked decodebin pad ->" << (isVideo ? "video" : "audio") << "queue";
+        }
+      } else {
+        qInfo() << "[LINK] queue sink pad already linked";
+      }
+      gst_object_unref(sinkpad);
+    } else {
+      qWarning() << "[LINK] target queue sink pad not available";
+    }
+
     gst_caps_unref(caps);
   }
 
@@ -518,6 +610,9 @@ private:
   GstElement* ares_{nullptr};
   GstElement* asink_{nullptr};
 
+  // Optional decrypt element (cencdec)
+  GstElement* cencdec_{nullptr};
+
   GstBus*     bus_{nullptr};
   QTimer      busTimer_;
   QTimer      sliderTimer_;
@@ -552,83 +647,86 @@ int main(int argc, char** argv) {
 
   qInfo() << "[MAIN] Starting with media:" << originalPath;
 
-  const QString baseName = fi.completeBaseName(); // without extension
+  // === Auto-provision /tmp/<KID>.key from companion keys file if possible ===
+  // This helps cencdec locate the key by KID without manual steps.
+  QFileInfo fi(originalPath);
+  const QString baseName = fi.completeBaseName();
   const QString dirPath = fi.absolutePath();
+  const QString keysPath = dirPath + "/" + baseName + "_keys.txt";
 
-  // Build a list of candidate keys files to be robust to suffixes like "_encrypted"
-  QStringList candidates;
-  candidates << dirPath + "/" + baseName + "_keys.txt";
+  if (QFile::exists(keysPath)) {
+    qInfo() << "[MAIN] Companion keys file found:" << keysPath << " — attempting to extract KEY1 and map to default_KID";
 
-  // if the filename ends with common suffixes, also try the base without them
-  const QStringList suffixesToStrip = {"_encrypted", "_frag", "_fragged"};
-  for (const QString& suf : suffixesToStrip) {
-    if (baseName.endsWith(suf)) {
-      const QString shortened = baseName.left(baseName.size() - suf.size());
-      candidates << dirPath + "/" + shortened + "_keys.txt";
-      // also try direct name without suffix just in case
-      candidates << dirPath + "/" + shortened;
-    }
-  }
-
-  // Also try legacy possibilities (just in case)
-  candidates << dirPath + "/" + baseName;                   // keys file named exactly like base
-  candidates << dirPath + "/" + baseName + "_encrypted";    // less common variant
-
-  QString keysPath;
-  for (const QString &c : candidates) {
-    if (QFile::exists(c)) {
-      keysPath = c;
-      qInfo() << "[MAIN] Using keys file candidate:" << keysPath;
-      break;
-    }
-  }
-
-  QString pathToPlay = originalPath; // default
-
-  if (!keysPath.isEmpty()) {
-    qInfo() << "[MAIN] Found keys file:" << keysPath << " — attempting mp4decrypt to temporary file";
-
-    // read keys file (expected format: "1:<HEX>" and "2:<HEX>" lines)
-    QString key1, key2;
+    // read KEY1 from keys file (format expected: 1:<HEX>)
+    QString key1;
     QFile kf(keysPath);
     if (kf.open(QIODevice::ReadOnly | QIODevice::Text)) {
       while (!kf.atEnd()) {
         const QString line = QString::fromUtf8(kf.readLine()).trimmed();
-        if (line.startsWith("1:")) key1 = line.mid(2);
-        else if (line.startsWith("2:")) key2 = line.mid(2);
+        if (line.startsWith("1:")) {
+          key1 = line.mid(2).trimmed();
+          break;
+        }
       }
       kf.close();
     } else {
-      qCritical() << "[MAIN] Failed to open keys file:" << keysPath;
+      qWarning() << "[MAIN] Failed to open keys file for reading:" << keysPath;
     }
 
-    if (!key1.isEmpty() && !key2.isEmpty()) {
-      // build temp output path
-      const QString tmpOut = QDir::tempPath() + "/" + baseName + "_decrypted_" + QString::number(QCoreApplication::applicationPid()) + ".mp4";
+    if (!key1.isEmpty()) {
+      // run mp4dump to extract default_KID
+      QProcess p;
+      p.start("mp4dump", QStringList() << originalPath);
+      if (p.waitForFinished(3000)) {
+        const QString out = QString::fromUtf8(p.readAllStandardOutput());
+        QRegularExpression re("default_KID[^0-9A-Fa-f]*([0-9A-Fa-f]{32})", QRegularExpression::CaseInsensitiveOption);
+        QRegularExpressionMatch m = re.match(out);
+        if (m.hasMatch()) {
+          const QString kidHex = m.captured(1).toLower();
+          const QString tmpKeyPath = QDir::tempPath() + "/" + kidHex + ".key";
+          qInfo() << "[MAIN] Found default_KID in container:" << kidHex << " — writing" << tmpKeyPath;
 
-      // construct mp4decrypt args: --key 1:<key1> --key 2:<key2> <input> <output>
-      QStringList args;
-      args << "--key" << ("1:" + key1) << "--key" << ("2:" + key2) << originalPath << tmpOut;
-
-      qInfo() << "[MAIN] Executing mp4decrypt (blocking): mp4decrypt" << args.join(" ");
-
-      // Execute synchronously. QProcess::execute returns exit code.
-      int rc = QProcess::execute("mp4decrypt", args);
-      if (rc == 0 && QFile::exists(tmpOut)) {
-        qInfo() << "[MAIN] mp4decrypt succeeded. Playing decrypted temp file:" << tmpOut;
-        pathToPlay = tmpOut;
+          // convert hex string to binary and write file
+          QByteArray bin;
+          bool ok = true;
+          QString kclean = key1;
+          kclean = kclean.trimmed();
+          kclean = kclean.toLower();
+          if (kclean.size() % 2 != 0) ok = false;
+          for (int i = 0; ok && i < kclean.length(); i += 2) {
+            bool convOk = false;
+            const QString byteStr = kclean.mid(i, 2);
+            const uint val = byteStr.toUInt(&convOk, 16);
+            if (!convOk) { ok = false; break; }
+            bin.append(static_cast<char>(val));
+          }
+          if (ok && !bin.isEmpty()) {
+            QFile outF(tmpKeyPath);
+            if (outF.open(QIODevice::WriteOnly)) {
+              outF.write(bin);
+              outF.close();
+              QFile::setPermissions(outF.fileName(), QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+              qInfo() << "[MAIN] Wrote binary key file:" << tmpKeyPath;
+            } else {
+              qWarning() << "[MAIN] Failed to open" << tmpKeyPath << "for writing";
+            }
+          } else {
+            qWarning() << "[MAIN] KEY1 parse failed or empty; not writing" << tmpKeyPath;
+          }
+        } else {
+          qWarning() << "[MAIN] default_KID not found in mp4dump output";
+        }
       } else {
-        qCritical() << "[MAIN] mp4decrypt failed (rc=" << rc << "). Falling back to original path for debugging.";
+        qWarning() << "[MAIN] mp4dump did not finish in time or failed when inspecting container";
       }
     } else {
-      qCritical() << "[MAIN] Keys file present but keys not found (expected '1:HEX' and '2:HEX').";
+      qWarning() << "[MAIN] KEY1 not present in" << keysPath << "; cannot write /tmp/<KID>.key";
     }
   } else {
-    qInfo() << "[MAIN] No keys file found alongside media. Playing provided path.";
+    qInfo() << "[MAIN] No companion keys file found near media; skipping /tmp/<KID>.key provisioning";
   }
 
-
-  GstQtPlayer w(pathToPlay);
+  GstQtPlayer w(originalPath);
   w.show();
   return app.exec();
 }
