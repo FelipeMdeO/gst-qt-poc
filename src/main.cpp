@@ -9,6 +9,13 @@
 #include <QElapsedTimer>
 #include <QDebug>
 
+#include <QFileInfo>
+#include <QFile>
+#include <QDir>
+#include <QProcess>
+#include <QCoreApplication>
+#include <QIODevice>
+
 #include <algorithm>
 #include <vector>
 #include <cstdlib>
@@ -537,14 +544,91 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  const QString path = QString::fromLocal8Bit(argv[1]);
-  if (path.isEmpty()) {
+  const QString originalPath = QString::fromLocal8Bit(argv[1]);
+  if (originalPath.isEmpty()) {
     qCritical() << "Invalid path.";
     return 1;
   }
 
-  qInfo() << "[MAIN] Starting with media:" << path;
-  GstQtPlayer w(path);
+  qInfo() << "[MAIN] Starting with media:" << originalPath;
+
+  const QString baseName = fi.completeBaseName(); // without extension
+  const QString dirPath = fi.absolutePath();
+
+  // Build a list of candidate keys files to be robust to suffixes like "_encrypted"
+  QStringList candidates;
+  candidates << dirPath + "/" + baseName + "_keys.txt";
+
+  // if the filename ends with common suffixes, also try the base without them
+  const QStringList suffixesToStrip = {"_encrypted", "_frag", "_fragged"};
+  for (const QString& suf : suffixesToStrip) {
+    if (baseName.endsWith(suf)) {
+      const QString shortened = baseName.left(baseName.size() - suf.size());
+      candidates << dirPath + "/" + shortened + "_keys.txt";
+      // also try direct name without suffix just in case
+      candidates << dirPath + "/" + shortened;
+    }
+  }
+
+  // Also try legacy possibilities (just in case)
+  candidates << dirPath + "/" + baseName;                   // keys file named exactly like base
+  candidates << dirPath + "/" + baseName + "_encrypted";    // less common variant
+
+  QString keysPath;
+  for (const QString &c : candidates) {
+    if (QFile::exists(c)) {
+      keysPath = c;
+      qInfo() << "[MAIN] Using keys file candidate:" << keysPath;
+      break;
+    }
+  }
+
+  QString pathToPlay = originalPath; // default
+
+  if (!keysPath.isEmpty()) {
+    qInfo() << "[MAIN] Found keys file:" << keysPath << " — attempting mp4decrypt to temporary file";
+
+    // read keys file (expected format: "1:<HEX>" and "2:<HEX>" lines)
+    QString key1, key2;
+    QFile kf(keysPath);
+    if (kf.open(QIODevice::ReadOnly | QIODevice::Text)) {
+      while (!kf.atEnd()) {
+        const QString line = QString::fromUtf8(kf.readLine()).trimmed();
+        if (line.startsWith("1:")) key1 = line.mid(2);
+        else if (line.startsWith("2:")) key2 = line.mid(2);
+      }
+      kf.close();
+    } else {
+      qCritical() << "[MAIN] Failed to open keys file:" << keysPath;
+    }
+
+    if (!key1.isEmpty() && !key2.isEmpty()) {
+      // build temp output path
+      const QString tmpOut = QDir::tempPath() + "/" + baseName + "_decrypted_" + QString::number(QCoreApplication::applicationPid()) + ".mp4";
+
+      // construct mp4decrypt args: --key 1:<key1> --key 2:<key2> <input> <output>
+      QStringList args;
+      args << "--key" << ("1:" + key1) << "--key" << ("2:" + key2) << originalPath << tmpOut;
+
+      qInfo() << "[MAIN] Executing mp4decrypt (blocking): mp4decrypt" << args.join(" ");
+
+      // Execute synchronously. QProcess::execute returns exit code.
+      int rc = QProcess::execute("mp4decrypt", args);
+      if (rc == 0 && QFile::exists(tmpOut)) {
+        qInfo() << "[MAIN] mp4decrypt succeeded. Playing decrypted temp file:" << tmpOut;
+        pathToPlay = tmpOut;
+      } else {
+        qCritical() << "[MAIN] mp4decrypt failed (rc=" << rc << "). Falling back to original path for debugging.";
+      }
+    } else {
+      qCritical() << "[MAIN] Keys file present but keys not found (expected '1:HEX' and '2:HEX').";
+    }
+  } else {
+    qInfo() << "[MAIN] No keys file found alongside media. Playing provided path.";
+  }
+
+
+  GstQtPlayer w(pathToPlay);
   w.show();
   return app.exec();
 }

@@ -28,6 +28,7 @@ ENCRYPTED="${WORKDIR}/${BASE}_encrypted.mp4"
 DECRYPTED="${WORKDIR}/${BASE}_decrypted.mp4"
 LOG_ENC="${WORKDIR}/${BASE}_mp4encrypt.out"
 LOG_ENC_TRY="${WORKDIR}/${BASE}_mp4encrypt_try.out"
+KEYFILE="${WORKDIR}/${BASE}_keys.txt"   # <-- new artifact: keys output
 
 # Fixed test key (you may change these if you want)
 # NOTE: if you prefer to force a specific key, set USE_FIXED_KEY=1
@@ -153,6 +154,21 @@ if [ -z "${KEY1:-}" ] || [ -z "${KEY2:-}" ]; then
   # Do not abort here automatically — user may choose to proceed. But we will abort to avoid false decrypts.
   exit 7
 fi
+
+# ----------------------------
+# NEW: write keys to a file so the player (or other tools) can use them
+# Format: one key per line: <track>:<hexkey>
+# Example:
+# 1:b29ac3cfbef6519a1986feb4547c39be
+# 2:b29ac3cfbef6519a1986feb4547c39be
+# ----------------------------
+echo " * Writing keys to file: $KEYFILE (mode 600)"
+{
+  printf "1:%s\n" "$KEY1"
+  printf "2:%s\n" "$KEY2"
+} > "$KEYFILE"
+chmod 600 "$KEYFILE" || true
+echo "   -> $KEYFILE"
 
 echo
 echo "[STEP 2.2] Inspect encrypted file (tenc/senc/pssh/default_KID)"
